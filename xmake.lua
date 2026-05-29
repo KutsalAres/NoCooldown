@@ -1,13 +1,11 @@
-add_rules("mode.debug", "mode.release")
-
-add_repositories("liteldev-repo https://github.com/LiteLDev/xmake-repo.git")
-
-add_requires("levilamina 0.13.4")
+add_rules("mode.release", "mode.debug")
 
 target("NoCooldown")
     set_kind("shared")
     set_languages("c++20")
-    add_files("src/*.cpp")
-    add_packages("levilamina")
-    set_symbols("debug")
-    set_optimize("fastest")
+    add_files("src/main.cpp")
+    add_includedirs("src")
+    add_syslinks("android", "log")
+    if is_plat("android") then
+        set_arch("arm64-v8a")
+    end
