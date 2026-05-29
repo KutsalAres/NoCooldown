@@ -4,6 +4,20 @@
 
 static uintptr_t s_rodata = 0, s_drr = 0, s_libBase = 0;
 static size_t s_rodataSize = 0, s_drrSize = 0;
+static FILE* g_log = nullptr;
+
+void WriteLog(const char* fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    LOG("[NoCooldown] %s", buf);
+    if (g_log) {
+        fprintf(g_log, "%s\n", buf);
+        fflush(g_log);
+    }
+}
 
 uintptr_t GetLibSection(const char* libname, const char* section_name, size_t* out_size) {
     if (!libname) return 0;
@@ -72,6 +86,8 @@ void** FindVtable(const char* typeStr) {
         Dl_info info;
         if (dladdr((void*)s_rodata, &info))
             s_libBase = (uintptr_t)info.dli_fbase;
+        WriteLog("rodata=0x%lX size=%zu drr=0x%lX size=%zu",
+            s_rodata, s_rodataSize, s_drr, s_drrSize);
     }
 
     char* ztsPtr = nullptr;
@@ -86,7 +102,10 @@ void** FindVtable(const char* typeStr) {
         }
         offset = (uintptr_t)match - s_rodata + 1;
     }
-    if (!ztsPtr) return nullptr;
+    if (!ztsPtr) {
+        WriteLog("ZTS not found: %s", typeStr);
+        return nullptr;
+    }
 
     uintptr_t zts = (uintptr_t)ztsPtr;
     uintptr_t zti = 0;
@@ -96,7 +115,10 @@ void** FindVtable(const char* typeStr) {
             break;
         }
     }
-    if (!zti) return nullptr;
+    if (!zti) {
+        WriteLog("ZTI not found: %s", typeStr);
+        return nullptr;
+    }
 
     uintptr_t vtable = 0;
     for (size_t i = 0; i < s_drrSize; i += sizeof(uintptr_t)) {
@@ -109,50 +131,56 @@ void** FindVtable(const char* typeStr) {
             if (!vtable) vtable = potential;
         }
     }
-    if (!vtable) return nullptr;
+    if (!vtable) {
+        WriteLog("ZTV not found: %s", typeStr);
+        return nullptr;
+    }
 
-    LOG("[NoCooldown] %s -> ZTV: 0x%lX", typeStr, vtable - s_libBase);
+    WriteLog("%s -> ZTV: 0x%lX", typeStr, vtable - s_libBase);
     return (void**)vtable;
 }
 
 static void Hook_startCooldown(void*, void*, void*) {}
-static void Hook_startItemCooldown(void*, void*, void*, int) {}
 
 void HookCooldowns() {
     if (!s_drr)
         s_drr = GetLibSection("libminecraftpe.so", ".data.rel.ro", &s_drrSize);
 
-    // CooldownItemComponent::startCooldown - slot 13
-    void** vt1 = FindVtable("20CooldownItemComponent");
-    if (vt1) {
-        uintptr_t slotAddr = (uintptr_t)&vt1[13];
-        if (SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ | PROT_WRITE)) {
-            vt1[13] = (void*)Hook_startCooldown;
-            SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ);
-            LOG("[NoCooldown] Patched CooldownItemComponent slot 13");
-        }
-    } else {
-        LOG("[NoCooldown] CooldownItemComponent vtable not found");
-    }
+    const char* targets[] = {
+        "20CooldownItemComponent",
+        "27ScriptItemCooldownComponent",
+        nullptr
+    };
 
-    // ScriptItemCooldownComponent::startCooldown - slot 13
-    void** vt2 = FindVtable("27ScriptItemCooldownComponent");
-    if (vt2) {
-        uintptr_t slotAddr = (uintptr_t)&vt2[13];
-        if (SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ | PROT_WRITE)) {
-            vt2[13] = (void*)Hook_startCooldown;
-            SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ);
-            LOG("[NoCooldown] Patched ScriptItemCooldownComponent slot 13");
+    for (int t = 0; targets[t]; t++) {
+        void** vt = FindVtable(targets[t]);
+        if (!vt) continue;
+
+        // Log ilk 20 slot
+        for (int i = 0; i < 20; i++) {
+            uintptr_t fn = (uintptr_t)vt[i];
+            if (!fn) break;
+            WriteLog("%s vt[%d] = 0x%lX", targets[t], i, fn - s_libBase);
         }
-    } else {
-        LOG("[NoCooldown] ScriptItemCooldownComponent vtable not found");
+
+        // Slot 13'ü patch et
+        uintptr_t slotAddr = (uintptr_t)&vt[13];
+        if (SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ | PROT_WRITE)) {
+            vt[13] = (void*)Hook_startCooldown;
+            SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ);
+            WriteLog("Patched %s slot 13", targets[t]);
+        } else {
+            WriteLog("mprotect failed: %s slot 13", targets[t]);
+        }
     }
 }
 
 __attribute__((constructor))
 void Init() {
-    LOG("[NoCooldown] Loaded");
+    g_log = fopen("/storage/emulated/0/nocooldown_log.txt", "w");
+    WriteLog("NoCooldown Loaded");
     HookCooldowns();
+    WriteLog("Done");
 }
 
 #endif
