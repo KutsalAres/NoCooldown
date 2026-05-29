@@ -146,31 +146,18 @@ void HookCooldowns() {
     if (!s_drr)
         s_drr = GetLibSection("libminecraftpe.so", ".data.rel.ro", &s_drrSize);
 
-    const char* targets[] = {
-        "21CooldownItemComponent",
-        "27ScriptItemCooldownComponent",
-        nullptr
-    };
+    void** vt = FindVtable("21CooldownItemComponent");
+    if (!vt) return;
 
-    for (int t = 0; targets[t]; t++) {
-        void** vt = FindVtable(targets[t]);
-        if (!vt) continue;
-
-        // Log ilk 20 slot
-        for (int i = 0; i < 20; i++) {
-            uintptr_t fn = (uintptr_t)vt[i];
-            if (!fn) break;
-            WriteLog("%s vt[%d] = 0x%lX", targets[t], i, fn - s_libBase);
-        }
-
-        // Slot 13'ü patch et
-        uintptr_t slotAddr = (uintptr_t)&vt[13];
+    // Tüm slotları patch et (0-14)
+    for (int i = 0; i < 15; i++) {
+        uintptr_t slotAddr = (uintptr_t)&vt[i];
+        uintptr_t fn = (uintptr_t)vt[i];
+        if (!fn) break;
         if (SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ | PROT_WRITE)) {
-            vt[13] = (void*)Hook_startCooldown;
+            vt[i] = (void*)Hook_startCooldown;
             SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ);
-            WriteLog("Patched %s slot 13", targets[t]);
-        } else {
-            WriteLog("mprotect failed: %s slot 13", targets[t]);
+            WriteLog("Patched slot %d (was 0x%lX)", i, fn - s_libBase);
         }
     }
 }
