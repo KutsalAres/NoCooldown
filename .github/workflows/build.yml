@@ -1,29 +1,30 @@
 name: Build NoCooldown
 
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+on: [push, pull_request]
 
 jobs:
   build:
-    runs-on: windows-latest
-
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
 
-      - name: Setup XMake
-        uses: xmake-io/github-action-setup-xmake@v1
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
 
-      - name: Configure
-        run: xmake config --mode=release
+      - name: Install xmake
+        run: |
+          curl -fsSL https://xmake.io/shget.text | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Build
-        run: xmake build
+        run: |
+          xmake f -p android -a arm64-v8a --ndk=$ANDROID_NDK_ROOT -m release
+          xmake build
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: NoCooldown
-          path: build/windows/x64/release/*.dll
+          name: NoCooldown.so
+          path: build/android/arm64-v8a/release/libNoCooldown.so
