@@ -147,7 +147,7 @@ void HookCooldowns() {
         s_drr = GetLibSection("libminecraftpe.so", ".data.rel.ro", &s_drrSize);
 
     const char* targets[] = {
-        "20CooldownItemComponent",
+        "21CooldownItemComponent",
         "27ScriptItemCooldownComponent",
         nullptr
     };
