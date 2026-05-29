@@ -1,0 +1,29 @@
+name: Build NoCooldown
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup XMake
+        uses: xmake-io/github-action-setup-xmake@v1
+
+      - name: Configure
+        run: xmake config --mode=release
+
+      - name: Build
+        run: xmake build
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: NoCooldown
+          path: build/windows/x64/release/*.dll
