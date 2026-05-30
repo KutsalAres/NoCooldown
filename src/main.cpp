@@ -1,4 +1,6 @@
 #include "main.hpp"
+#include <fstream>
+#include <sys/stat.h>
 
 #ifdef __ANDROID__
 
@@ -6,21 +8,60 @@ static uintptr_t s_rodata = 0, s_drr = 0, s_libBase = 0;
 static size_t s_rodataSize = 0, s_drrSize = 0;
 static FILE* g_log = nullptr;
 
-// Log yazma fonksiyonu
+// Klasör ve dosya yolları
+const char* baseDir = "/storage/emulated/0/games/NoCooldown";
+const char* logPath = "/storage/emulated/0/games/NoCooldown/latest_log.txt";
+const char* configPath = "/storage/emulated/0/games/NoCooldown/Config.json";
+
 void WriteLog(const char* fmt, ...) {
-    char buf[512];
+    char buf[1024];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+
+    // Zaman damgası ekleyelim
+    time_t now = time(0);
+    struct tm tstruct = *localtime(&now);
+    char timeBuf[80];
+    strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &tstruct);
+
     LOG("[NoCooldown] %s", buf);
     if (g_log) {
-        fprintf(g_log, "%s\n", buf);
+        fprintf(g_log, "[%s] %s\n", timeBuf, buf);
         fflush(g_log);
     }
 }
 
-// Bellek izinlerini ayarlama (Patch atmak için şart)
+// Klasör yoksa oluştur
+void EnsureDirectoryExists(const char* path) {
+    struct stat st = {0};
+    if (stat(path, &st) == -1) {
+        mkdir(path, 0700);
+    }
+}
+
+// Basit bir JSON okuyucu (Harici kütüphane eklememek için manuel)
+int ReadSlotFromConfig() {
+    std::ifstream file(configPath);
+    if (!file.is_open()) {
+        // Dosya yoksa varsayılan oluştur
+        std::ofstream outfile(configPath);
+        outfile << "{\n  \"target_slot\": 14\n}";
+        outfile.close();
+        return 14;
+    }
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.find("target_slot") != std::string::npos) {
+            size_t colon = line.find(":");
+            return std::stoi(line.substr(colon + 1));
+        }
+    }
+    return 14;
+}
+
+// Bellek izinleri
 bool SetMemoryPermission(uintptr_t addr, size_t len, int prot) {
     if (!addr || !len) return false;
     size_t pagesize = sysconf(_SC_PAGESIZE);
@@ -29,7 +70,6 @@ bool SetMemoryPermission(uintptr_t addr, size_t len, int prot) {
     return mprotect((void*)aligned, aligned_len, prot) == 0;
 }
 
-// libminecraftpe.so içindeki bölümleri (.rodata vb.) bulma
 uintptr_t GetLibSection(const char* libname, const char* section_name, size_t* out_size) {
     uintptr_t base_addr = 0;
     FILE* maps = fopen("/proc/self/maps", "r");
@@ -41,46 +81,47 @@ uintptr_t GetLibSection(const char* libname, const char* section_name, size_t* o
         }
     }
     fclose(maps);
-
+    
     Dl_info info;
     if (dladdr((void*)base_addr, &info)) {
         int fd = open(info.dli_fname, O_RDONLY);
-        if (fd >= 0) {
-            struct stat st;
-            fstat(fd, &st);
-            void* map_base = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            close(fd);
-            if (map_base != MAP_FAILED) {
-                ElfW(Ehdr)* ehdr = (ElfW(Ehdr)*)map_base;
-                ElfW(Shdr)* shdr = (ElfW(Shdr)*)((uintptr_t)map_base + ehdr->e_shoff);
-                const char* shstrtab = (const char*)((uintptr_t)map_base + shdr[ehdr->e_shstrndx].sh_offset);
-                for (int i = 0; i < ehdr->e_shnum; i++) {
-                    if (strcmp(shstrtab + shdr[i].sh_name, section_name) == 0) {
-                        uintptr_t res = base_addr + shdr[i].sh_addr;
-                        if (out_size) *out_size = shdr[i].sh_size;
-                        munmap(map_base, st.st_size);
-                        return res;
-                    }
-                }
+        if (fd < 0) return 0;
+        struct stat st;
+        fstat(fd, &st);
+        void* map_base = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (map_base == MAP_FAILED) return 0;
+
+        ElfW(Ehdr)* ehdr = (ElfW(Ehdr)*)map_base;
+        ElfW(Shdr)* shdr = (ElfW(Shdr)*)((uintptr_t)map_base + ehdr->e_shoff);
+        const char* shstrtab = (const char*)((uintptr_t)map_base + shdr[ehdr->e_shstrndx].sh_offset);
+        for (int i = 0; i < ehdr->e_shnum; i++) {
+            if (strcmp(shstrtab + shdr[i].sh_name, section_name) == 0) {
+                uintptr_t res = base_addr + shdr[i].sh_addr;
+                if (out_size) *out_size = shdr[i].sh_size;
                 munmap(map_base, st.st_size);
+                return res;
             }
         }
+        munmap(map_base, st.st_size);
     }
     return 0;
 }
 
-// VTable adresini bulma algoritması
 void** FindVtable(const char* typeStr) {
     if (!s_rodata) {
         s_rodata = GetLibSection("libminecraftpe.so", ".rodata", &s_rodataSize);
         s_drr    = GetLibSection("libminecraftpe.so", ".data.rel.ro", &s_drrSize);
         Dl_info info;
         if (dladdr((void*)s_rodata, &info)) s_libBase = (uintptr_t)info.dli_fbase;
-        WriteLog("LibBase: 0x%lX | rodata: 0x%lX", s_libBase, s_rodata);
+        WriteLog("Hafıza Haritası: Base=0x%lX | Rodata=0x%lX", s_libBase, s_rodata);
     }
 
     char* ztsPtr = (char*)memmem((void*)s_rodata, s_rodataSize, typeStr, strlen(typeStr) + 1);
-    if (!ztsPtr) return nullptr;
+    if (!ztsPtr) {
+        WriteLog("Kritik Hata: %s (ZTS) bulunamadı!", typeStr);
+        return nullptr;
+    }
 
     uintptr_t zts = (uintptr_t)ztsPtr;
     uintptr_t zti = 0;
@@ -100,45 +141,45 @@ void** FindVtable(const char* typeStr) {
     return nullptr;
 }
 
-// --- MOD MANTIĞI ---
-
-// Oyun cooldown sorduğunda her zaman 0 (tick) kaldı diyeceğiz.
-int Hook_AlwaysZero(void* instance) {
+// Hook Fonksiyonu
+int Hook_ReturnZero(void* instance) {
     return 0;
 }
 
-void ApplyNoCooldown() {
-    // Termux strings çıktısında en güvenilir görünen sınıf
-    const char* target = "21CooldownItemComponent";
-    
-    void** vt = FindVtable(target);
-    if (!vt) {
-        WriteLog("Hata: %s vtable bulunamadi!", target);
-        return;
-    }
+void ApplyPatch() {
+    int targetSlot = ReadSlotFromConfig();
+    WriteLog("Config okundu. Hedef Slot: %d", targetSlot);
 
-    WriteLog("%s bulundu, yamalaniyor...", target);
+    const char* className = "21CooldownItemComponent";
+    void** vt = FindVtable(className);
 
-    // Tehlikeli (0,1,2) slotları atlayıp, cooldown ile ilgili olabilecek 
-    // slotları (9, 10, 12) hedefliyoruz.
-    int targets[] = {9, 10, 12}; 
+    if (vt) {
+        uintptr_t slotAddr = (uintptr_t)&vt[targetSlot];
+        uintptr_t originalFn = (uintptr_t)vt[targetSlot];
 
-    for (int slot : targets) {
-        uintptr_t slotAddr = (uintptr_t)&vt[slot];
+        WriteLog("Orijinal Fonksiyon Ofseti (vt[%d]): 0x%lX", targetSlot, originalFn - s_libBase);
+
         if (SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ | PROT_WRITE)) {
-            vt[slot] = (void*)Hook_AlwaysZero;
+            vt[targetSlot] = (void*)Hook_ReturnZero;
             SetMemoryPermission(slotAddr, sizeof(uintptr_t), PROT_READ);
-            WriteLog("Slot %d yamalandi (0 döndürecek)", slot);
+            WriteLog("BAŞARILI: Slot %d yamalandı.", targetSlot);
+        } else {
+            WriteLog("HATA: Bellek yazma izni alınamadı!");
         }
     }
 }
 
 __attribute__((constructor))
 void Init() {
-    g_log = fopen("/storage/emulated/0/nocooldown_log.txt", "w");
-    WriteLog("--- NoCooldown Mod Baslatildi ---");
-    ApplyNoCooldown();
-    WriteLog("--- Islem Tamam ---");
+    EnsureDirectoryExists(baseDir);
+    g_log = fopen(logPath, "w");
+    
+    WriteLog("=== NoCooldown Mod Pro v1.0 ===");
+    WriteLog("Geliştirici: KutsalAres");
+    
+    ApplyPatch();
+    
+    WriteLog("=== Başlatma Tamamlandı ===");
 }
 
 #endif
