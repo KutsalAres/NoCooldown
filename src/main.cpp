@@ -12,7 +12,6 @@
 #include <string>
 #include <thread>
 #include <chrono>
-#include <vector>
 
 #define LOG_TAG "NoCooldownPro"
 #define LOG_PATH "/storage/emulated/0/games/NoCooldown"
@@ -38,31 +37,24 @@ void WriteLog(const char* fmt, ...) {
     }
 }
 
-// GÜÇLENDİRİLMİŞ UNPROTECT
-bool SafeUnprotect(uintptr_t addr, size_t len = 8) {
+bool SafeUnprotect(uintptr_t addr) {
     size_t pagesize = sysconf(_SC_PAGESIZE);
     uintptr_t aligned = addr & ~(pagesize - 1);
-    
-    // Deneme 1: Tam yetki (Bazı kernel'lar veri bölgesinde EXEC sevmez)
-    if (mprotect((void*)aligned, pagesize * 2, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) return true;
-    
-    // Deneme 2: Sadece Okuma-Yazma (En güvenli ve başarılı olan budur)
-    if (mprotect((void*)aligned, pagesize * 2, PROT_READ | PROT_WRITE) == 0) return true;
-    
-    return false;
+    if (mprotect((void*)aligned, pagesize * 4, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) return true;
+    return mprotect((void*)aligned, pagesize * 4, PROT_READ | PROT_WRITE) == 0;
 }
 
 uintptr_t GetLibSection(const char* libname, const char* section_name, size_t* out_size) {
     uintptr_t base_addr = 0;
-    char lib_path[512] = {0};
     FILE* maps = fopen("/proc/self/maps", "r");
     if (!maps) return 0;
     char line[512];
+    char lib_path[512] = {0};
     while (fgets(line, sizeof(line), maps)) {
         if (strstr(line, libname)) {
             char path[256] = {0};
             if (sscanf(line, "%lx-%*x %*s %*x %*s %*d %255s", &base_addr, path) >= 1) {
-                if (path[0] == '/') { strncpy(lib_path, path, sizeof(lib_path) - 1); break; }
+                if (path[0] == '/') { strncpy(lib_path, path, sizeof(lib_path)-1); break; }
             }
         }
     }
@@ -113,56 +105,35 @@ void** FindVtable(const char* typeStr) {
     return nullptr;
 }
 
-int hooked_getCooldown(void* a) { return 0; }
+// 0 döndüren cooldown fonksiyonu
+int hooked_zero(void* a) { return 0; }
 
 void ApplyPatch() {
-    WriteLog("--- [v6.0 PRO] Yama Baslatildi ---");
+    WriteLog("--- [v7.0 MULTI-SLOT] Baslatildi ---");
     void** vt = FindVtable("21CooldownItemComponent");
     if (!vt) {
-        WriteLog("HATA: Vtable adresi bulunamadi.");
+        WriteLog("HATA: Vtable bulunamadi.");
         return;
     }
     WriteLog("Vtable Adresi: %p", vt);
 
-    uintptr_t originalFunc = (uintptr_t)vt[14];
-    uintptr_t slotAddr = (uintptr_t)&vt[14];
-
-    if (originalFunc < 0x1000) {
-        WriteLog("HATA: Gecersiz slot adresi (0x%lx).", originalFunc);
-        return;
-    }
-
-    // ANA VTABLE YAMASI (SafeUnprotect artik daha inatci)
-    if (SafeUnprotect(slotAddr)) {
-        *(uintptr_t*)slotAddr = (uintptr_t)hooked_getCooldown;
-        WriteLog("TAMAM: Ana Vtable slotu yamalandi.");
-    } else {
-        WriteLog("KRITIK HATA: mprotect hala yazma izni vermiyor.");
-        // Alternatif olarak hafizadaki kütüphane haritasına bakarak unprotect denenebilir ama 
-        // PROT_READ|PROT_WRITE genelde her zaman calisir.
-    }
-
-    size_t drrSize;
-    uintptr_t drr = GetLibSection("libminecraftpe.so", ".data.rel.ro", &drrSize);
-    int replacedCount = 0;
-    if (drr) {
-        for (size_t i = 0; i < drrSize; i += sizeof(uintptr_t)) {
-            uintptr_t* entry = (uintptr_t*)(drr + i);
-            if (*entry == originalFunc) {
-                if (SafeUnprotect((uintptr_t)entry)) {
-                    *entry = (uintptr_t)hooked_getCooldown;
-                    replacedCount++;
-                }
-            }
+    // Kritik cooldown slotları: 12, 13, 14, 15
+    // Minecraft sürümüne göre değişebileceği için bu bloğu toplu yamalıyoruz
+    int slots[] = {12, 13, 14, 15};
+    
+    for(int slot : slots) {
+        uintptr_t slotAddr = (uintptr_t)&vt[slot];
+        if (SafeUnprotect(slotAddr)) {
+            *(uintptr_t*)slotAddr = (uintptr_t)hooked_zero;
+            WriteLog("TAMAM: Slot %d yamalandi.", slot);
         }
-        WriteLog("REFERANS: %d adet ek yer yamalandi.", replacedCount);
     }
-    WriteLog("--- [YAMA TAMAMLANDI] ---");
+
+    WriteLog("--- YAMA TAMAMLANDI ---");
 }
 
 __attribute__((constructor))
 void init() {
-    WriteLog("=== NoCooldown Mod v6.0 Yuklendi ===");
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(25));
         ApplyPatch();
