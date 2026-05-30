@@ -10,19 +10,47 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <string>
+#include <thread> // EKSİKTİ, EKLENDİ
+#include <chrono> // EKSİKTİ, EKLENDİ
+#include <stdarg.h>
 
 // --- AYARLAR VE LOG ---
-#define LOG_TAG "LeviMod_NoCooldown"
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOG_TAG "NoCooldownPro"
+#define LOG_PATH "/storage/emulated/0/games/NoCooldown/"
+#define LOG_FILE "/storage/emulated/0/games/NoCooldown/mod_log.txt"
+
+// Hem Logcat'e hem de dosyaya yazan zırhlı log fonksiyonu
+void WriteLog(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    // 1. Logcat (MatLog için)
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
+
+    // 2. Dosya Kaydı (İstediğin klasöre)
+    mkdir("/storage/emulated/0/games", 0777);
+    mkdir(LOG_PATH, 0777);
+    
+    FILE* f = fopen(LOG_FILE, "a");
+    if (f) {
+        time_t now = time(0);
+        char* dt = ctime(&now);
+        if(dt) dt[strlen(dt) - 1] = '\0';
+        fprintf(f, "[%s] %s\n", dt ? dt : "??", buf);
+        fclose(f);
+    }
+}
 
 // Termux'ta bulduğumuz altın bilgiler
 static const uintptr_t COOLDOWN_OFFSET = 0x223b9f7; 
 static const char* TARGET_LIB = "libminecraftpe.so";
 
-// --- YARDIMCI FONKSİYONLAR (EnchantUnbound Stilinde) ---
+// --- YARDIMCI FONKSİYONLAR ---
 
-// Kütüphanenin belirli bir bölümünü (örneğin .text veya .data.rel.ro) bulur
-uintptr_t GetLibSection(const char* libname, const char* section_name, size_t* out_size) {
+uintptr_t GetLibBase(const char* libname) {
     uintptr_t base_addr = 0;
     FILE* maps = fopen("/proc/self/maps", "r");
     if (!maps) return 0;
@@ -34,10 +62,9 @@ uintptr_t GetLibSection(const char* libname, const char* section_name, size_t* o
         }
     }
     fclose(maps);
-    return base_addr; // Basitleştirilmiş versiyon, base adresi döndürür
+    return base_addr;
 }
 
-// Bellek yazma izinlerini açar (Crash koruması)
 bool Unprotect(uintptr_t addr, size_t len) {
     size_t pagesize = sysconf(_SC_PAGESIZE);
     uintptr_t aligned_addr = addr & ~(pagesize - 1);
@@ -46,38 +73,26 @@ bool Unprotect(uintptr_t addr, size_t len) {
 
 // --- HİLE MANTIĞI ---
 
-// Bizim "Sıfır Bekleme" fonksiyonumuz
 int hooked_getCooldownTicks(void* instance) {
-    // Oyun bu fonksiyonu çağırdığında her zaman 0 döner, bekleme biter.
     return 0; 
 }
 
-// Tüm referansları yönlendiren ana fonksiyon
 void ApplyProfessionalPatch() {
-    LOG("No-Cooldown Yama islemi baslatildi...");
+    WriteLog("Yama islemi baslatildi...");
 
-    // 1. Kütüphane taban adresini al
-    uintptr_t libBase = GetLibSection(TARGET_LIB, nullptr, nullptr);
+    uintptr_t libBase = GetLibBase(TARGET_LIB);
     if (!libBase) {
-        LOG("HATA: libminecraftpe.so hafizada bulunamadi!");
+        WriteLog("HATA: %s hafizada bulunamadi!", TARGET_LIB);
         return;
     }
 
-    // 2. Termux offset'ini kullanarak orijinal fonksiyonu bul
     uintptr_t originalFuncAddr = libBase + COOLDOWN_OFFSET;
     uintptr_t myHook = (uintptr_t)hooked_getCooldownTicks;
 
-    LOG("Orijinal Fonksiyon: 0x%lx", originalFuncAddr);
-    LOG("Yama Fonksiyonu:    0x%lx", myHook);
+    WriteLog("Base: 0x%lx | Hedef: 0x%lx", libBase, originalFuncAddr);
 
-    // 3. .data.rel.ro Bölümünü Tara (EnchantUnbound'un en güçlü taktiği)
-    // Bu kısım, vtable içindeki ve dışındaki tüm çağrıları yakalar.
-    // Not: Gerçek projede section boundary'leri GetLibSection ile çekilir. 
-    // Burada güvenlik için geniş bir tarama yapıyoruz.
-    
     int replacedCount = 0;
-    // Kütüphanenin veri kısmında orijinal fonksiyonun adresini ara
-    // Genellikle base'den sonraki 20MB-50MB arası veri kısmıdır
+    // .data.rel.ro taraması (Önemli: Base'den sonraki 64MB'lık alanı tara)
     for (uintptr_t p = libBase; p < libBase + 0x4000000; p += sizeof(uintptr_t)) {
         uintptr_t* entry = (uintptr_t*)p;
         
@@ -90,11 +105,9 @@ void ApplyProfessionalPatch() {
     }
 
     if (replacedCount > 0) {
-        LOG("BASARILI: %d adet referans senin fonksiyonuna baglandi!", replacedCount);
+        WriteLog("BASARILI: %d adet vtable referansi guncellendi!", replacedCount);
     } else {
-        // Eğer referans bulamazsak, direkt vtable slotunu zorla (B Planı)
-        LOG("Uyari: Referans bulunamadi, manuel vtable denemesi...");
-        // Burada vtable slotuna direkt yazma kodu eklenebilir.
+        WriteLog("HATA: Referans bulunamadi. Offset veya surum hatasi olabilir.");
     }
 }
 
@@ -102,12 +115,10 @@ void ApplyProfessionalPatch() {
 
 __attribute__((constructor))
 void init() {
-    // Logcat'e ve varsa dosyaya yaz
-    LOG("=== NoCooldown Mod Pro v2.0 Yuklendi ===");
+    WriteLog("=== NoCooldown Mod Yuklendi ===");
     
-    // Oyunun yüklenmesini beklemesi için bir thread açıyoruz
+    // Ayrı bir thread açarak oyunu kilitlemeden bekle
     std::thread([]() {
-        LOG("Mod 10 saniye icinde aktif olacak...");
         std::this_thread::sleep_for(std::chrono::seconds(10));
         ApplyProfessionalPatch();
     }).detach();
