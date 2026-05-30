@@ -7,25 +7,32 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <elf.h>
 #include <string>
 #include <thread>
 #include <chrono>
-#include <vector>
 
+// --- AYARLAR VE LOG SİSTEMİ ---
 #define LOG_TAG "NoCooldownPro"
+#define LOG_PATH "/storage/emulated/0/games/NoCooldown"
 #define LOG_FILE "/storage/emulated/0/games/NoCooldown/mod_log.txt"
 
-// --- LOG SİSTEMİ ---
+// Hem Logcat'e hem dosyaya yazan fonksiyon
 void WriteLog(const char* fmt, ...) {
     char buf[1024];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+
+    // 1. Logcat (Canlı takip)
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
-    
+
+    // 2. Dosya Kaydı
     mkdir("/storage/emulated/0/games", 0777);
-    mkdir("/storage/emulated/0/games/NoCooldown", 0777);
+    mkdir(LOG_PATH, 0777);
+    
     FILE* f = fopen(LOG_FILE, "a");
     if (f) {
         time_t now = time(0);
@@ -37,130 +44,133 @@ void WriteLog(const char* fmt, ...) {
     }
 }
 
-// --- BELLEK KORUMASI ---
+// --- ELF PARSER ---
+
+uintptr_t GetLibSection(const char* libname, const char* section_name, size_t* out_size) {
+    uintptr_t base_addr = 0;
+    char lib_path[512] = {0};
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        if (strstr(line, libname)) {
+            char path[256] = {0};
+            if (sscanf(line, "%lx-%*x %*s %*x %*s %*d %255s", &base_addr, path) >= 1) {
+                if (path[0] == '/') {
+                    strncpy(lib_path, path, sizeof(lib_path) - 1);
+                    break;
+                }
+            }
+        }
+    }
+    fclose(maps);
+
+    if (lib_path[0] == '\0' || base_addr == 0) return 0;
+
+    int fd = open(lib_path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    struct stat st;
+    fstat(fd, &st);
+    void* map_base = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    uintptr_t section_addr = 0;
+    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)map_base;
+    Elf64_Shdr* shdr = (Elf64_Shdr*)((uintptr_t)map_base + ehdr->e_shoff);
+    const char* shstrtab = (const char*)((uintptr_t)map_base + shdr[ehdr->e_shstrndx].sh_offset);
+
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        if (strcmp(shstrtab + shdr[i].sh_name, section_name) == 0) {
+            section_addr = base_addr + shdr[i].sh_addr;
+            if (out_size) *out_size = shdr[i].sh_size;
+            break;
+        }
+    }
+    munmap(map_base, st.st_size);
+    return section_addr;
+}
+
 bool Unprotect(uintptr_t addr, size_t len) {
     size_t pagesize = sysconf(_SC_PAGESIZE);
     uintptr_t aligned = addr & ~(pagesize - 1);
     return mprotect((void*)aligned, pagesize * 2, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
 }
 
-// --- SCANNER MANTIĞI (EnchantUnbound Stilinde) ---
+// --- VTABLE FINDER ---
 
-struct LibRegion { uintptr_t start, end; };
+void** FindVtable(const char* typeStr) {
+    size_t rodataSize, drrSize;
+    uintptr_t rodata = GetLibSection("libminecraftpe.so", ".rodata", &rodataSize);
+    uintptr_t drr = GetLibSection("libminecraftpe.so", ".data.rel.ro", &drrSize);
 
-std::vector<LibRegion> GetLibRegions(const char* libname) {
-    std::vector<LibRegion> regions;
-    FILE* maps = fopen("/proc/self/maps", "r");
-    if (maps) {
-        char line[512];
-        while (fgets(line, sizeof(line), maps)) {
-            if (strstr(line, libname)) {
-                uintptr_t s, e;
-                sscanf(line, "%lx-%lx", &s, &e);
-                regions.push_back({s, e});
-            }
+    if (!rodata || !drr) return nullptr;
+
+    char* ztsPtr = (char*)memmem((void*)rodata, rodataSize, typeStr, strlen(typeStr) + 1);
+    if (!ztsPtr) return nullptr;
+
+    uintptr_t zts = (uintptr_t)ztsPtr;
+    uintptr_t zti = 0;
+    for (size_t i = 0; i < drrSize; i += sizeof(uintptr_t)) {
+        if (*(uintptr_t*)(drr + i) == zts) {
+            zti = drr + i - sizeof(uintptr_t);
+            break;
         }
-        fclose(maps);
     }
-    return regions;
+    if (!zti) return nullptr;
+
+    for (size_t i = 0; i < drrSize; i += sizeof(uintptr_t)) {
+        if (*(uintptr_t*)(drr + i) == zti) {
+            return (void**)(drr + i + sizeof(uintptr_t));
+        }
+    }
+    return nullptr;
 }
 
-uintptr_t FindAddressInRegions(const std::vector<LibRegion>& regions, uintptr_t targetAddr) {
-    for (const auto& reg : regions) {
-        for (uintptr_t p = reg.start; p < reg.end - sizeof(uintptr_t); p += sizeof(uintptr_t)) {
-            if (*(uintptr_t*)p == targetAddr) return p;
-        }
-    }
-    return 0;
-}
+int hooked_getCooldown(void* a) { return 0; }
 
-int hooked_getCooldown(void* instance) { return 0; }
-
-void StartProfessionalPatch() {
-    WriteLog("--- Yama Islemi Baslatildi (Walker Mode) ---");
-
-    auto regions = GetLibRegions("libminecraftpe.so");
-    if (regions.empty()) {
-        WriteLog("HATA: libminecraftpe.so bulunamadi.");
-        return;
-    }
-
-    // 1. ADIM: Sınıf ismini bul (ZTS)
-    const char* targetClassName = "21CooldownItemComponent";
-    uintptr_t classStrAddr = 0;
-    for (const auto& reg : regions) {
-        for (uintptr_t p = reg.start; p < reg.end - strlen(targetClassName); p++) {
-            if (memcmp((void*)p, targetClassName, strlen(targetClassName)) == 0) {
-                classStrAddr = p;
-                break;
-            }
-        }
-        if (classStrAddr) break;
-    }
-
-    if (!classStrAddr) {
-        WriteLog("HATA: Sinif ismi hafizada bulunamadi.");
-        return;
-    }
-    WriteLog("Sinif ismi bulundu: 0x%lx", classStrAddr);
-
-    // 2. ADIM: TypeInfo'yu (ZTI) bul (İsmi işaret eden pointer)
-    uintptr_t ztiAddr = FindAddressInRegions(regions, classStrAddr);
-    if (!ztiAddr) {
-        WriteLog("HATA: TypeInfo (ZTI) bulunamadi.");
-        return;
-    }
-    // ZTI genellikle pointer'dan 8-16 byte öncesinde başlar
-    ztiAddr -= sizeof(uintptr_t); 
-    WriteLog("TypeInfo (ZTI) adresi: 0x%lx", ztiAddr);
-
-    // 3. ADIM: VTable'ı (ZTV) bul (TypeInfo'yu işaret eden pointer)
-    uintptr_t vtableEntry = FindAddressInRegions(regions, ztiAddr);
-    if (!vtableEntry) {
-        WriteLog("HATA: VTable (ZTV) bulunamadi.");
-        return;
-    }
+void ApplyPatch() {
+    WriteLog("--- [Enchant Edition] Yama Baslatildi ---");
     
-    // C++ ABI'da VTable, ZTI pointer'ından 8 byte sonra başlar
-    uintptr_t vtableStart = vtableEntry + sizeof(uintptr_t);
-    WriteLog("VTable baslangici: 0x%lx", vtableStart);
-
-    // 4. ADIM: Slot Yamalama (Slot 14 genelde getCooldownTicks'tir)
-    int targetSlot = 14; 
-    uintptr_t patchAddr = vtableStart + (targetSlot * sizeof(uintptr_t));
-    uintptr_t originalFunc = *(uintptr_t*)patchAddr;
-
-    WriteLog("Orijinal Fonksiyon (Slot %d): 0x%lx", targetSlot, originalFunc);
-
-    if (Unprotect(patchAddr, sizeof(uintptr_t))) {
-        *(uintptr_t*)patchAddr = (uintptr_t)hooked_getCooldown;
-        WriteLog("BASARILI: VTable yamalandi!");
-    } else {
-        WriteLog("HATA: Yazma izni alinamadi.");
+    void** vt = FindVtable("21CooldownItemComponent");
+    if (!vt) {
+        WriteLog("HATA: CooldownItemComponent Vtable bulunamadi!");
         return;
     }
+    WriteLog("Vtable Adresi: %p", vt);
 
-    // 5. ADIM: Tum referansları tara (Redirect)
-    int replacedCount = 0;
-    for (const auto& reg : regions) {
-        // Sadece veri bölgelerini tarayarak hızı artırıyoruz
-        for (uintptr_t p = reg.start; p < reg.end - sizeof(uintptr_t); p += sizeof(uintptr_t)) {
-            if (*(uintptr_t*)p == originalFunc) {
-                if (Unprotect(p, sizeof(uintptr_t))) {
-                    *(uintptr_t*)p = (uintptr_t)hooked_getCooldown;
-                    replacedCount++;
-                }
-            }
+    // getCooldownTicks slotu (Genellikle 14)
+    uintptr_t slotAddr = (uintptr_t)&vt[14];
+    uintptr_t originalFunc = (uintptr_t)vt[14];
+
+    if (Unprotect(slotAddr, 8)) {
+        *(uintptr_t*)slotAddr = (uintptr_t)hooked_getCooldown;
+        WriteLog("Vtable Slottu Yamalandi (Slot 14)");
+    }
+
+    // Redirect referansları temizle
+    size_t drrSize;
+    uintptr_t drr = GetLibSection("libminecraftpe.so", ".data.rel.ro", &drrSize);
+    int replaced = 0;
+
+    for (size_t i = 0; i < drrSize; i += sizeof(uintptr_t)) {
+        uintptr_t* entry = (uintptr_t*)(drr + i);
+        if (*entry == originalFunc) {
+            Unprotect((uintptr_t)entry, 8);
+            *entry = (uintptr_t)hooked_getCooldown;
+            replaced++;
         }
     }
-    WriteLog("Referans Yonlendirme: %d adet ek yer yamalandi.", replacedCount);
+    WriteLog("Toplam %d adet referans yonlendirildi.", replaced);
+    WriteLog("--- YAMA TAMAMLANDI ---");
 }
 
 __attribute__((constructor))
 void init() {
-    WriteLog("=== NoCooldown Pro v4.0 Baslatildi ===");
+    WriteLog("=== NoCooldown Mod v5.2 Baslatildi ===");
     std::thread([]() {
-        std::this_thread::sleep_for(std::chrono::seconds(15)); // Daha güvenli bir bekleme
-        StartProfessionalPatch();
+        sleep(15);
+        ApplyPatch();
     }).detach();
 }
