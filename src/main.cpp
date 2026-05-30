@@ -23,6 +23,7 @@ void WriteLog(const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
+    
     mkdir("/storage/emulated/0/games", 0777);
     mkdir("/storage/emulated/0/games/NoCooldown", 0777);
     FILE* f = fopen(LOG_FILE, "a");
@@ -36,105 +37,130 @@ void WriteLog(const char* fmt, ...) {
     }
 }
 
-// --- BELLEK YÖNETİMİ ---
+// --- BELLEK KORUMASI ---
 bool Unprotect(uintptr_t addr, size_t len) {
     size_t pagesize = sysconf(_SC_PAGESIZE);
     uintptr_t aligned = addr & ~(pagesize - 1);
     return mprotect((void*)aligned, pagesize * 2, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
 }
 
-// --- SCANNER (EnchantUnbound Mantığı) ---
-// Hafızada bir string arar (VTable ismini bulmak için)
-uintptr_t FindString(uintptr_t start, uintptr_t end, const char* str) {
-    size_t len = strlen(str);
-    for (uintptr_t p = start; p < end - len; p++) {
-        if (memcmp((void*)p, str, len) == 0) return p;
-    }
-    return 0;
-}
+// --- SCANNER MANTIĞI (EnchantUnbound Stilinde) ---
 
-// Bizim hileli fonksiyonumuz
-int hooked_getCooldown(void* instance) { return 0; }
+struct LibRegion { uintptr_t start, end; };
 
-void StartProfessionalPatch() {
-    WriteLog("Scanner baslatildi: CooldownItemComponent araniyor...");
-
-    // 1. Kütüphaneyi bul
-    uintptr_t libBase = 0;
+std::vector<LibRegion> GetLibRegions(const char* libname) {
+    std::vector<LibRegion> regions;
     FILE* maps = fopen("/proc/self/maps", "r");
     if (maps) {
         char line[512];
         while (fgets(line, sizeof(line), maps)) {
-            if (strstr(line, "libminecraftpe.so")) {
-                sscanf(line, "%lx-%*x", &libBase);
-                break;
+            if (strstr(line, libname)) {
+                uintptr_t s, e;
+                sscanf(line, "%lx-%lx", &s, &e);
+                regions.push_back({s, e});
             }
         }
         fclose(maps);
     }
+    return regions;
+}
 
-    if (!libBase) {
-        WriteLog("HATA: Kütüphane bulunamadi.");
-        return;
-    }
-
-    // 2. VTable İsminden Adres Bulma (En Kesin Yöntem)
-    // Sınıf ismi: CooldownItemComponent (Mangled: _ZTV21CooldownItemComponent)
-    // Biz direkt sınıfın ham ismini arıyoruz.
-    const char* targetClassName = "21CooldownItemComponent";
-    uintptr_t classStr = FindString(libBase, libBase + 0x5000000, targetClassName);
-
-    if (!classStr) {
-        WriteLog("HATA: Sinif ismi bulunamadi! Sürüm uyumsuz olabilir.");
-        return;
-    }
-    WriteLog("Sinif ismi bulundu: 0x%lx", classStr);
-
-    // 3. Referansları Değiştirme
-    // Şimdi bu sınıfın vtable adresini kullanan yerleri bulup kendi fonksiyonumuza yönlendiriyoruz.
-    // Minecraft'ta cooldown fonksiyonu vtable içinde genellikle 14. slottadır.
-    
-    int replacedCount = 0;
-    uintptr_t myHook = (uintptr_t)hooked_getCooldown;
-
-    // Kütüphanenin veri kısmını tara
-    for (uintptr_t p = libBase + 0x3000000; p < libBase + 0x6000000; p += 8) {
-        uintptr_t* entry = (uintptr_t*)p;
-        
-        // Eğer bu adres bizim bulduğumuz sınıf ismine çok yakın bir yeri işaret ediyorsa
-        // Bu muhtemelen vtable girişidir.
-        if (*entry > libBase && *entry < libBase + 0x6000000) {
-             // Basit ama etkili: Eğer bu pointer'ın 14 slot ilerisi cooldown'sa değiştir
-             // (Bu kısım gelişmiş projelerde vtable doğrulaması ile yapılır)
+uintptr_t FindAddressInRegions(const std::vector<LibRegion>& regions, uintptr_t targetAddr) {
+    for (const auto& reg : regions) {
+        for (uintptr_t p = reg.start; p < reg.end - sizeof(uintptr_t); p += sizeof(uintptr_t)) {
+            if (*(uintptr_t*)p == targetAddr) return p;
         }
     }
+    return 0;
+}
 
-    // ALTERNATİF: Senin ofsetini "hizalayıp" (align) tekrar deneyelim
-    uintptr_t alignedOffset = 0x223b9f8; // f7'yi f8 yaptık (çift sayı)
-    uintptr_t targetFunc = libBase + alignedOffset;
+int hooked_getCooldown(void* instance) { return 0; }
 
-    for (uintptr_t p = libBase + 0x3000000; p < libBase + 0x6000000; p += 8) {
-        uintptr_t* entry = (uintptr_t*)p;
-        if (*entry == targetFunc) {
-            if (Unprotect((uintptr_t)entry, 8)) {
-                *entry = myHook;
-                replacedCount++;
+void StartProfessionalPatch() {
+    WriteLog("--- Yama Islemi Baslatildi (Walker Mode) ---");
+
+    auto regions = GetLibRegions("libminecraftpe.so");
+    if (regions.empty()) {
+        WriteLog("HATA: libminecraftpe.so bulunamadi.");
+        return;
+    }
+
+    // 1. ADIM: Sınıf ismini bul (ZTS)
+    const char* targetClassName = "21CooldownItemComponent";
+    uintptr_t classStrAddr = 0;
+    for (const auto& reg : regions) {
+        for (uintptr_t p = reg.start; p < reg.end - strlen(targetClassName); p++) {
+            if (memcmp((void*)p, targetClassName, strlen(targetClassName)) == 0) {
+                classStrAddr = p;
+                break;
+            }
+        }
+        if (classStrAddr) break;
+    }
+
+    if (!classStrAddr) {
+        WriteLog("HATA: Sinif ismi hafizada bulunamadi.");
+        return;
+    }
+    WriteLog("Sinif ismi bulundu: 0x%lx", classStrAddr);
+
+    // 2. ADIM: TypeInfo'yu (ZTI) bul (İsmi işaret eden pointer)
+    uintptr_t ztiAddr = FindAddressInRegions(regions, classStrAddr);
+    if (!ztiAddr) {
+        WriteLog("HATA: TypeInfo (ZTI) bulunamadi.");
+        return;
+    }
+    // ZTI genellikle pointer'dan 8-16 byte öncesinde başlar
+    ztiAddr -= sizeof(uintptr_t); 
+    WriteLog("TypeInfo (ZTI) adresi: 0x%lx", ztiAddr);
+
+    // 3. ADIM: VTable'ı (ZTV) bul (TypeInfo'yu işaret eden pointer)
+    uintptr_t vtableEntry = FindAddressInRegions(regions, ztiAddr);
+    if (!vtableEntry) {
+        WriteLog("HATA: VTable (ZTV) bulunamadi.");
+        return;
+    }
+    
+    // C++ ABI'da VTable, ZTI pointer'ından 8 byte sonra başlar
+    uintptr_t vtableStart = vtableEntry + sizeof(uintptr_t);
+    WriteLog("VTable baslangici: 0x%lx", vtableStart);
+
+    // 4. ADIM: Slot Yamalama (Slot 14 genelde getCooldownTicks'tir)
+    int targetSlot = 14; 
+    uintptr_t patchAddr = vtableStart + (targetSlot * sizeof(uintptr_t));
+    uintptr_t originalFunc = *(uintptr_t*)patchAddr;
+
+    WriteLog("Orijinal Fonksiyon (Slot %d): 0x%lx", targetSlot, originalFunc);
+
+    if (Unprotect(patchAddr, sizeof(uintptr_t))) {
+        *(uintptr_t*)patchAddr = (uintptr_t)hooked_getCooldown;
+        WriteLog("BASARILI: VTable yamalandi!");
+    } else {
+        WriteLog("HATA: Yazma izni alinamadi.");
+        return;
+    }
+
+    // 5. ADIM: Tum referansları tara (Redirect)
+    int replacedCount = 0;
+    for (const auto& reg : regions) {
+        // Sadece veri bölgelerini tarayarak hızı artırıyoruz
+        for (uintptr_t p = reg.start; p < reg.end - sizeof(uintptr_t); p += sizeof(uintptr_t)) {
+            if (*(uintptr_t*)p == originalFunc) {
+                if (Unprotect(p, sizeof(uintptr_t))) {
+                    *(uintptr_t*)p = (uintptr_t)hooked_getCooldown;
+                    replacedCount++;
+                }
             }
         }
     }
-
-    if (replacedCount > 0) {
-        WriteLog("BASARILI: %d adet referans yamanlandi!", replacedCount);
-    } else {
-        WriteLog("HATA: Otomatik tarama referans yakalayamadi.");
-    }
+    WriteLog("Referans Yonlendirme: %d adet ek yer yamalandi.", replacedCount);
 }
 
 __attribute__((constructor))
 void init() {
-    WriteLog("=== NoCooldown Pro v3.0 Baslatildi ===");
+    WriteLog("=== NoCooldown Pro v4.0 Baslatildi ===");
     std::thread([]() {
-        std::this_thread::sleep_for(std::chrono::seconds(12)); // Oyunun oturması için biraz daha süre
+        std::this_thread::sleep_for(std::chrono::seconds(15)); // Daha güvenli bir bekleme
         StartProfessionalPatch();
     }).detach();
 }
